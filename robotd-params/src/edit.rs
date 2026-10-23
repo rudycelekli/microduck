@@ -110,8 +110,10 @@ impl Model {
     /// a temporary file for saying what a case is about. [`Model::load`] is this plus the read.
     pub fn from_text(path: &Path, text: &str) -> Result<Self, String> {
         // The daemon's own parse first: a file robotd would refuse is not a file to edit
-        // blind, and the error names the line.
-        toml::from_str::<Params>(text).map_err(|e| format!("{}: {e}", path.display()))?;
+        // blind, and the error names the line. The daemon's, not a strict one — robotd starts
+        // on a file carrying a key this build retired, so the editor must open it too.
+        crate::parse_tolerating_unknown_keys(text)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let mut doc: DocumentMut = text
             .parse()
             .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -646,7 +648,7 @@ pub fn pad_bindings(path: &Path) -> Result<crate::PadParams, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
-    toml::from_str::<Params>(&text)
+    crate::parse_tolerating_unknown_keys(&text)
         .map(|params| params.pad)
         .map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -775,6 +777,34 @@ mod tests {
         assert!(out.contains("hz = 50 # do not touch"), "{out}");
         assert!(out.contains("# the speaker crackles above 0.8"), "{out}");
         assert!(out.contains("enabled = false"), "{out}");
+    }
+
+    /// **A file robotd starts on is a file the editor opens.** A key this build retired —
+    /// `[pad] dpad_down`, `[media] camera` — is ignored by the daemon's loader, so the robot
+    /// boots; a strict parse here refused the file instead, and every writer (`robotctl
+    /// configure`, `pad.bind`, `robot.loadPolicy`) failed on it, while `pad.bindings` answered
+    /// with the defaults rather than what `padd` was running.
+    #[test]
+    fn a_retired_key_does_not_lock_the_file_against_edits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("robotd.toml");
+        let text = "[pad]\ndpad_down = \"sit_toggle\"\nx = \"polite-bow\"\n";
+        std::fs::write(&path, text).expect("writes");
+        Params::load(&path, true).expect("robotd starts on it");
+
+        assert_eq!(pad_bindings(&path).expect("reads").x, "polite-bow");
+
+        let mut m = Model::load(&path).expect("the editor opens it");
+        m.edit(entry("audio.enabled"), "false").expect("edits");
+        m.save().expect("saves");
+        let out = std::fs::read_to_string(&path).expect("reads");
+        assert!(out.contains("dpad_down"), "the unknown key survives: {out}");
+        assert!(
+            !Params::load(&path, true)
+                .expect("still starts")
+                .audio
+                .enabled
+        );
     }
 
     /// A key set in a section the file does not have yet creates the section — the shipped

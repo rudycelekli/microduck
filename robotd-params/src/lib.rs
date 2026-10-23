@@ -2743,6 +2743,17 @@ fn prune_fields(prefix: &str, fields: &mut toml::Table, ignored: &mut Vec<String
 /// `deny_unknown_fields` stays on the structs. It is what makes that test possible, and it is
 /// the backstop here: if the registry ever did drift, the pruned table would still be rejected
 /// rather than quietly deserialised into something else.
+/// The parse [`Params::load`] does, without the read, the warning or the validation: strict first,
+/// and on failure the same text with its unknown keys pruned. For the editor, which has to open
+/// every file the daemon starts on — a writer that refused one would leave no way to change it
+/// short of deleting a key that does nothing.
+pub(crate) fn parse_tolerating_unknown_keys(text: &str) -> Result<Params, toml::de::Error> {
+    toml::from_str::<Params>(text).or_else(|strict| match without_unknown_keys(text) {
+        Some((reparsed, _)) => reparsed,
+        None => Err(strict),
+    })
+}
+
 #[allow(clippy::type_complexity)]
 fn without_unknown_keys(text: &str) -> Option<(Result<Params, toml::de::Error>, Vec<String>)> {
     let mut table: toml::Table = text.parse().ok()?;
