@@ -474,13 +474,21 @@ fn keygen(
     out: &Path,
     password: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = std::env::current_dir()?;
+    let cwd = std::env::current_dir()?;
+    // The checkout this xtask was built from, not the directory it was run in. `cargo run -p
+    // xtask` works from any subdirectory, and with the working directory as "the repository" the
+    // refusal only covered that subdirectory: from `docs/`, `--out <checkout>/deploy/keys` wrote a
+    // signing key into the tree.
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("xtask/ has no parent directory")?;
+    let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
     let target = out.canonicalize().unwrap_or_else(|_| {
         // Not created yet; resolve against cwd so the containment check still works.
         if out.is_absolute() {
             out.to_path_buf()
         } else {
-            repo.join(out)
+            cwd.join(out)
         }
     });
     if target.starts_with(&repo) {
