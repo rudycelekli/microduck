@@ -195,8 +195,11 @@ fn draw_card() -> &'static str {
     CARDS[(nanos as usize / 1000) % CARDS.len()]
 }
 
-/// A robot name as a repo name: lowercase, `[a-z0-9-_.]`, no runs of dashes, at most 80 characters
-/// so `-vetbook` still fits Hugging Face's 96.
+/// A robot name as a repo name: lowercase, `[a-z0-9-_.]`, no runs of dashes or of dots, at most 80
+/// characters so `-vetbook` still fits Hugging Face's 96.
+///
+/// Dots for the same reason as dashes: the Hub refuses a repo name containing `--` or `..`, so a
+/// duck called `R2..D2` made a dataset that could not be created and a share that could not happen.
 pub fn slug(name: &str) -> String {
     let mut out = String::new();
     for c in name.trim().chars().flat_map(char::to_lowercase) {
@@ -205,7 +208,7 @@ pub fn slug(name: &str) -> String {
         } else {
             '-'
         };
-        if c == '-' && out.ends_with('-') {
+        if matches!(c, '-' | '.') && out.ends_with(c) {
             continue;
         }
         out.push(c);
@@ -360,6 +363,15 @@ mod tests {
         assert_eq!(slug("---"), "microduck");
         assert_eq!(slug("ça va"), "a-va");
         assert!(slug(&"x".repeat(200)).len() <= 80);
+    }
+
+    /// The Hub refuses `..` in a repo name exactly as it refuses `--`, which this already collapsed.
+    /// A duck named `R2..D2` slugged to `r2..d2`, and its share failed creating the dataset.
+    #[test]
+    fn a_run_of_dots_is_collapsed_like_a_run_of_dashes() {
+        assert_eq!(slug("R2..D2"), "r2.d2");
+        assert_eq!(slug("duck...v2"), "duck.v2");
+        assert!(!slug("a . . b..c").contains(".."));
     }
 
     #[test]
