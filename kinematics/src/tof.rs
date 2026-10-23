@@ -183,14 +183,17 @@ impl Reprojector {
                 zones[i] = Zone::Floor { point };
                 continue;
             }
+            // The noise band is the sensor's own, so it is measured from the
+            // sensor; `range` is measured from the trunk axis, as documented.
             let horizontal = r * (dir_level[0] * dir_level[0] + dir_level[1] * dir_level[1]).sqrt();
             if horizontal < Self::MIN_RANGE_M {
                 zones[i] = Zone::TooClose;
                 continue;
             }
+            let point_level = level.rotate(point);
             zones[i] = Zone::Hit {
                 point,
-                range: horizontal,
+                range: point_level[0].hypot(point_level[1]),
             };
         }
         zones
@@ -260,7 +263,41 @@ mod tests {
         assert!((0.8..=1.2).contains(&point[0]), "x: {point:?}");
         assert!(point[1].abs() < 0.3, "y: {point:?}");
         assert!((point[2] - sensor.pos[2]).abs() < 0.3, "z: {point:?}");
-        assert!((0.8..=1.05).contains(&range), "range: {range}");
+        assert!((0.8..=1.2).contains(&range), "range: {range}");
+    }
+
+    /// `range` is the horizontal distance from the trunk's vertical axis, not
+    /// from the sensor: it was the horizontal part of the slant range, short
+    /// of the body by the sensor's forward offset (~8 cm level), so a client
+    /// stopping at a threshold placed every obstacle that much nearer (#430).
+    #[test]
+    fn range_is_measured_from_the_trunk_axis_not_the_sensor() {
+        let rp = Reprojector::alpha();
+        let leaned = Posture {
+            gravity: Quat::from_axis_angle([0.0, 1.0, 0.0], 0.2)
+                .conjugate()
+                .rotate([0.0, 0.0, -1.0]),
+            trunk_height_m: None,
+        };
+        for (head, posture) in [
+            (LEVEL, Posture::default()),
+            ([0.3, 0.2, 0.0, 0.0], Posture::default()),
+            ([0.0, 0.0, 0.8, 0.0], Posture::default()),
+            (LEVEL, leaned),
+        ] {
+            for r in [0.3, 1.0] {
+                let zones = rp.project(&one_return(CENTRE, r), head, &posture);
+                let Zone::Hit { point, range } = zones[CENTRE] else {
+                    panic!("expected a hit at {head:?}, {r} m: {:?}", zones[CENTRE]);
+                };
+                let p = level_from_gravity(posture.gravity).rotate(point);
+                let expected = p[0].hypot(p[1]);
+                assert!(
+                    (range - expected).abs() < 1e-9,
+                    "head {head:?}, {r} m: range {range} vs trunk-axis {expected}"
+                );
+            }
+        }
     }
 
     /// Head pitched down: a bottom-row beam at floor distance is the floor;
