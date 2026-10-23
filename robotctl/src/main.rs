@@ -867,8 +867,8 @@ fn run_chorale(socket: &Path, off: bool, piece: Option<u8>) -> Result<(), Failur
         }
         match (chorale.part.as_deref(), chorale.beats) {
             (Some(part), Some(beats)) => print!(
-                "\r  {part:<8} bar {:>4.0}  beat {:>5.1}  {} voices    ",
-                beats / 4.0 + 1.0,
+                "\r  {part:<8} bar {:>4}  beat {:>5.1}  {} voices    ",
+                bar_of(beats),
                 beats,
                 chorale.voices
             ),
@@ -891,6 +891,14 @@ fn run_chorale(socket: &Path, off: bool, piece: Option<u8>) -> Result<(), Failur
         println!("chorale stopped");
     }
     Ok(())
+}
+
+/// Which bar of four beats `beats` falls in, counted from one as a score counts them.
+///
+/// Floored, not rounded: the second half of a bar is still that bar, and rounding showed the
+/// next bar's number from beat three onwards.
+fn bar_of(beats: f64) -> u64 {
+    (beats.max(0.0) / 4.0).floor() as u64 + 1
 }
 
 /// A ten-cell meter for the mouth opening — the one part of the readout you can watch
@@ -5680,6 +5688,20 @@ mod head_imu_tests {
 
 #[cfg(test)]
 mod tests {
+
+    // ── robotctl chorale ─────────────────────────────────────────────────
+
+    /// The live line's bar number is the bar the beat is in. Rounding `beats / 4 + 1` put beat
+    /// three, the second half of bar one, in bar two — and so on through every bar of a piece.
+    #[test]
+    fn the_chorale_counts_bars_the_way_a_score_does() {
+        assert_eq!(super::bar_of(0.0), 1, "the downbeat opens bar one");
+        assert_eq!(super::bar_of(2.0), 1, "half way through bar one");
+        assert_eq!(super::bar_of(3.9), 1, "the last beat of bar one");
+        assert_eq!(super::bar_of(4.0), 2);
+        assert_eq!(super::bar_of(47.0), 12, "beat 47 is the last of bar twelve");
+        assert_eq!(super::bar_of(48.0), 13);
+    }
 
     // ── robotctl logs ────────────────────────────────────────────────────
 
