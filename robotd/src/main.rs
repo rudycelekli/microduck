@@ -4324,8 +4324,7 @@ async fn handle(
     // What to advertise, once `btd` has subscribed. A second stream on the same connection, which
     // is why the read loop selects over a pair of options rather than one receiver.
     let mut beacons: Option<tokio::sync::broadcast::Receiver<proto::ChoraleAdvertise>> = None;
-    let mut decimate = Duration::ZERO;
-    let mut last_sent: Option<Instant> = None;
+    let mut decimate = Decimator::new(Duration::ZERO);
 
     loop {
         // Three things can happen: a request arrives, a state frame is due for a subscriber, or a
@@ -4387,11 +4386,7 @@ async fn handle(
                             Ok(state) => {
                                 // Decimate per subscriber: a dashboard asking for 10 Hz
                                 // should not cost what a digital twin asking for 50 does.
-                                let due = last_sent
-                                    .map(|at| at.elapsed() >= decimate)
-                                    .unwrap_or(true);
-                                if due {
-                                    last_sent = Some(Instant::now());
+                                if decimate.due(Instant::now()) {
                                     write_line(&mut write_half, &proto::Request::notify_state(&state))
                                         .await?;
                                 }
@@ -4461,14 +4456,15 @@ async fn handle(
         }
 
         if let Ok(proto::Call::RobotSubscribe(params)) = &call {
-            decimate = params
-                .hz
-                .filter(|hz| *hz > 0)
-                .map(|hz| Duration::from_secs_f64(1.0 / hz as f64))
-                .unwrap_or(Duration::ZERO);
+            decimate = Decimator::new(
+                params
+                    .hz
+                    .filter(|hz| *hz > 0)
+                    .map(|hz| Duration::from_secs_f64(1.0 / hz as f64))
+                    .unwrap_or(Duration::ZERO),
+            );
             // Subscribing again replaces the rate rather than opening a second stream.
             states = Some(state.state_tx.subscribe());
-            last_sent = None;
         }
 
         let response = match call {
@@ -5563,6 +5559,42 @@ fn dispatch(
                 format!("{} is not served by robotd", other.method()),
             ),
         ),
+    }
+}
+
+/// Which state frames a subscriber that asked for a rate is sent.
+///
+/// The next frame is due a period after the last *deadline*, not after the last send, and may
+/// arrive up to a quarter-period early. The loop's ticks are a period apart give or take
+/// scheduling jitter, so timing from the last send with no slack dropped every frame that came
+/// a hair early, and the one after it was then a period late: a twin asking for 50 Hz from the
+/// 50 Hz loop lost a frame for every early tick.
+struct Decimator {
+    period: Duration,
+    next: Option<Instant>,
+}
+
+impl Decimator {
+    fn new(period: Duration) -> Self {
+        Self { period, next: None }
+    }
+
+    fn due(&mut self, now: Instant) -> bool {
+        let Some(next) = self.next else {
+            self.next = Some(now + self.period);
+            return true;
+        };
+        if now + self.period / 4 < next {
+            return false;
+        }
+        // A stream that paused for longer than a period starts its schedule again from now,
+        // rather than owing the subscriber a burst of frames to catch up.
+        self.next = Some(if now > next + self.period {
+            now + self.period
+        } else {
+            next + self.period
+        });
+        true
     }
 }
 
@@ -7576,6 +7608,35 @@ mod tests {
         );
         assert_eq!(frame.policy, "held", "no policy was loaded");
         assert_eq!(frame.joints.len(), NUM_JOINTS);
+    }
+
+    /// A subscriber gets the rate it asked for. Frames reach it a tick apart give or take
+    /// scheduling jitter, and timing each one from the last send with no slack dropped every
+    /// frame that came a little early: 50 Hz asked of the 50 Hz loop arrived at 30 Hz here.
+    #[test]
+    fn a_subscriber_gets_the_rate_it_asked_for_through_jitter() {
+        let start = Instant::now();
+        // Five seconds of the 50 Hz loop, each tick up to a millisecond early or late.
+        let ticks: Vec<Instant> = (0..250u64)
+            .map(|i| {
+                let jitter = [0i64, -1, 1, -1, 1][(i % 5) as usize];
+                let at = (20 * i as i64 + jitter).max(0) as u64;
+                start + Duration::from_millis(at)
+            })
+            .collect();
+        for hz in [50u32, 25, 10] {
+            let mut d = Decimator::new(Duration::from_secs_f64(1.0 / f64::from(hz)));
+            let sent = ticks.iter().filter(|at| d.due(**at)).count();
+            // The first frame goes at once, so a window can hold one more than the rate.
+            let expected = 5 * hz as usize;
+            assert!(
+                (expected..=expected + 1).contains(&sent),
+                "asked for {hz} Hz for 5 s, sent {sent}"
+            );
+        }
+        // No rate asked for is every frame.
+        let mut every = Decimator::new(Duration::ZERO);
+        assert!(ticks.iter().all(|at| every.due(*at)));
     }
 
     /// Measured velocity and load must reach the state stream.
