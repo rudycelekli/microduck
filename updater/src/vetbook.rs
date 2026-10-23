@@ -254,8 +254,13 @@ pub fn shared_copy(
 
 /// The dataset's `README.md`: what this is, the card, and where it came from.
 fn dataset_card(name: &str, user: &str, url: &str, image: &str) -> String {
+    // Quoted as a JSON string, which YAML reads as a double-quoted scalar: the name is whatever
+    // `system.setName` was given, and a `"` or `\` in it pasted between quotes ended the scalar
+    // early or made an escape YAML refuses, so the card's front matter stopped being YAML.
+    let pretty_name =
+        serde_json::to_string(&format!("{name}'s vet book")).expect("a string serialises");
     format!(
-        "---\npretty_name: \"{name}'s vet book\"\ntags:\n- microduck\n- robotics\n- pollen-robotics\n\
+        "---\npretty_name: {pretty_name}\ntags:\n- microduck\n- robotics\n- pollen-robotics\n\
          - vetbook\n---\n\n# {name}'s vet book\n\n[![{name}'s vet book card]({image})]({url})\n\n\
          The lifetime record of **{name}**, a [microduck](https://pollen-robotics.com) belonging to \
          [@{user}](https://huggingface.co/{user}): hours awake, distance walked, falls, cuddles, \
@@ -384,6 +389,26 @@ mod tests {
         assert_eq!(shared["share"]["card"], "purikura");
         assert_eq!(shared["share"]["owner"], "apirrone");
         assert_eq!(shared["share"]["robot"], "graphite-bang");
+    }
+
+    /// The front matter stays YAML whatever the robot is called.
+    ///
+    /// A name is free text from `system.setName`, and `Daisy "the duck"` pasted between the
+    /// quotes of `pretty_name: "…"` ended the scalar at `Daisy ` with text left over: front matter
+    /// that no YAML parser reads. JSON quoting is a YAML double-quoted scalar, so reading the value
+    /// back as JSON is reading it back as YAML.
+    #[test]
+    fn a_name_with_quotes_keeps_the_card_metadata_readable() {
+        for name in [r#"Daisy "the duck""#, r"back\slash", "plain"] {
+            let card = dataset_card(name, "apirrone", "https://x/d", "https://x/i.png");
+            let value = card
+                .lines()
+                .find_map(|l| l.strip_prefix("pretty_name: "))
+                .expect("a pretty_name line");
+            let parsed: String = serde_json::from_str(value)
+                .unwrap_or_else(|e| panic!("{value} is not a quoted scalar: {e}"));
+            assert_eq!(parsed, format!("{name}'s vet book"));
+        }
     }
 
     #[test]
