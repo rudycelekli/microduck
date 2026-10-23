@@ -16,7 +16,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Longest name accepted.
+/// Longest name accepted, in bytes.
+///
+/// Bytes, because the budget below is bytes: counted in characters, 24 CJK characters are 72
+/// bytes and 24 accented ones 48, so the truncation this constant exists to do here, visibly, was
+/// left to the adapter for exactly the names that need it. ASCII names are unaffected.
 ///
 /// Bounded by BLE, not by taste: a legacy advertisement has 31 bytes of payload total, and the
 /// local name shares it with flags and a 16-byte service UUID. A name longer than this is
@@ -184,7 +188,7 @@ impl Store {
     }
 }
 
-/// Trim, drop anything unprintable, and truncate to [`MAX_NAME`] on a character boundary.
+/// Trim, drop anything unprintable, and truncate to [`MAX_NAME`] bytes on a character boundary.
 ///
 /// Control characters are the ones that matter: this string reaches a BLE advertisement, a log
 /// line and eventually an app's UI, and a newline in it would let a name split a journal record
@@ -196,14 +200,16 @@ fn sanitise(requested: &str) -> String {
         .filter(|c| !c.is_control())
         .collect();
 
-    // `chars().take()` rather than slicing by byte: a name is UTF-8 and truncating mid-codepoint
-    // would panic.
-    cleaned
-        .chars()
-        .take(MAX_NAME)
-        .collect::<String>()
-        .trim_end()
-        .to_owned()
+    // Whole characters while they fit, rather than slicing by byte: a name is UTF-8 and
+    // truncating mid-codepoint would panic.
+    let mut name = String::new();
+    for c in cleaned.chars() {
+        if name.len() + c.len_utf8() > MAX_NAME {
+            break;
+        }
+        name.push(c);
+    }
+    name.trim_end().to_owned()
 }
 
 #[cfg(test)]
@@ -256,7 +262,34 @@ mod tests {
     fn a_long_multibyte_name_is_truncated_without_panicking() {
         let dir = tempfile::tempdir().unwrap();
         let stored = store(dir.path()).set_name(&"é".repeat(80)).unwrap();
-        assert_eq!(stored.chars().count(), MAX_NAME);
+        assert_eq!(stored, "é".repeat(MAX_NAME / 2));
+    }
+
+    /// The bound is the advertisement's, which is bytes. Counted in characters, a name of 24
+    /// accented or CJK characters was stored whole at two or three times the budget, and whatever
+    /// the radio does with an oversized name happened instead of the truncation reported here.
+    #[test]
+    fn a_name_is_bounded_in_bytes_not_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        for requested in [
+            "アヒルのダックちゃんロボット",
+            &"é".repeat(24),
+            &"x".repeat(40),
+        ] {
+            let stored = store.set_name(requested).unwrap();
+            assert!(
+                stored.len() <= MAX_NAME,
+                "{stored:?} is {} bytes",
+                stored.len()
+            );
+            assert!(requested.starts_with(&stored), "{stored:?} is not a prefix");
+        }
+        // Eight three-byte characters are exactly the budget, and are kept whole.
+        assert_eq!(
+            store.set_name("アヒルのダックち").unwrap(),
+            "アヒルのダックち"
+        );
     }
 
     /// The stored name is what the caller must display, so the difference is returned rather
