@@ -180,14 +180,21 @@ impl Pool {
             let mut lines = BufReader::new(read).lines();
             loop {
                 match lines.next_line().await {
-                    Ok(Some(line)) => {
+                    Ok(Some(line)) => match replies.try_send(line) {
+                        Ok(()) => {}
                         // A full queue means the peer cannot keep up. Give up on the line rather
                         // than the session: telemetry is advisory, and blocking here would stall
                         // every other service too.
-                        if replies.try_send(line).is_err() {
+                        Err(mpsc::error::TrySendError::Full(_)) => {
                             tracing::debug!(upstream = %label, "dropped a line; peer is behind");
                         }
-                    }
+                        // Nobody is left to read it: the session is over. Stop reading, so this
+                        // half closes with the write half the pool already dropped. A daemon that
+                        // only writes once subscribed — `padd`'s tap is one — learns the peer is
+                        // gone from its next write failing, and it never would while this went
+                        // on draining the socket for nobody.
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    },
                     Ok(None) => break,
                     Err(e) => {
                         tracing::debug!(upstream = %label, error = %e, "upstream read failed");
@@ -239,6 +246,65 @@ mod tests {
             write.flush().await.unwrap();
             request
         })
+    }
+
+    /// A subscription ends when the session that asked for it does.
+    ///
+    /// `padd`'s tap reads one request and then only writes, so the one thing that ends it is a
+    /// write failing. A reader that kept draining the socket after the session had gone kept
+    /// every such write succeeding: a subscription, an open connection and a task per session that
+    /// had ever subscribed, for the life of the daemon.
+    #[tokio::test]
+    async fn a_subscription_is_let_go_when_the_session_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("padd.sock");
+        let sockets = Sockets {
+            robot: dir.path().join("robotd.sock"),
+            updater: dir.path().join("updaterd.sock"),
+            config: dir.path().join("configd.sock"),
+            pad: path.clone(),
+            tof: dir.path().join("tofd.sock"),
+        };
+
+        // A daemon shaped like the pad tap: one request in, then notifications out until a write
+        // fails. It answers with how it ended.
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            BufReader::new(read)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap();
+            loop {
+                let notification = b"{\"jsonrpc\":\"2.0\",\"method\":\"pad.input\"}\n";
+                if write.write_all(notification).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let (replies, forwarded) = mpsc::channel(1);
+        let mut pool = Pool::new(sockets, replies);
+        pool.send(
+            proto::Service::Pad,
+            proto::Lane::Prompt,
+            r#"{"jsonrpc":"2.0","id":1,"method":"pad.input"}"#,
+        )
+        .await
+        .unwrap();
+
+        // The session ends: its pool and the receiver of everything the pool reads go with it.
+        drop(pool);
+        drop(forwarded);
+
+        tokio::time::timeout(Duration::from_secs(2), daemon)
+            .await
+            .expect("the daemon's writes must start failing once nobody can read them")
+            .unwrap();
     }
 
     /// The daemon restarted between two requests.
