@@ -81,6 +81,7 @@
 //! testable on a laptop against a fake service.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use duck_ipc_proto::{RemoteLink, RemoteStatus};
@@ -193,6 +194,9 @@ impl Default for Timings {
         }
     }
 }
+
+/// When the event stream last carried any bytes, pings included — what [`READ_TIMEOUT`] measures.
+type Heard = Arc<std::sync::Mutex<tokio::time::Instant>>;
 
 // ── what a client sees in the listing ────────────────────────────────────────
 
@@ -650,8 +654,8 @@ impl Relay {
 
     /// One connection: open the stream, register, then hold the lease until something breaks.
     async fn session(&self, token: &str, published: &mut Published<'_>) -> Ended {
-        let mut events = match self.open_stream(token).await {
-            Ok(events) => events,
+        let (mut events, heard) = match self.open_stream(token).await {
+            Ok(opened) => opened,
             Err(ended) => return ended,
         };
 
@@ -698,9 +702,27 @@ impl Relay {
         let mut polls = tokio::time::interval(self.timings.status_poll);
         polls.tick().await;
         let mut misses = 0;
+        // One deadline for the whole session, moved only by bytes arriving. A timeout built
+        // afresh around each `events.next()` starts over whenever the heartbeat fires, and the
+        // heartbeat is faster than the timeout, so a stream that had gone silent was never
+        // noticed. Bytes rather than events, because the service's ping is a keepalive the
+        // parser swallows: it is proof the stream is alive and never surfaces as a message.
+        let silence = tokio::time::sleep(self.timings.read_timeout);
+        tokio::pin!(silence);
 
         loop {
             tokio::select! {
+                () = &mut silence => {
+                    let last = *heard.lock().expect("not poisoned");
+                    if last.elapsed() >= self.timings.read_timeout {
+                        return Ended::Reconnect(format!(
+                            "nothing arrived on the event stream for {:?}, which is two missed \
+                             pings",
+                            self.timings.read_timeout
+                        ));
+                    }
+                    silence.as_mut().reset(last + self.timings.read_timeout);
+                }
                 _ = heartbeats.tick() => {
                     // Checked here rather than on its own timer: the heartbeat is already the
                     // fastest thing in this loop, so a `logout` takes effect within one cadence
@@ -746,20 +768,15 @@ impl Relay {
                     tracing::debug!("the bridged session finished");
                     bridged = None;
                 }
-                event = tokio::time::timeout(self.timings.read_timeout, events.next()) => {
+                event = events.next() => {
                     match event {
-                        Err(_) => return Ended::Reconnect(format!(
-                            "nothing arrived on the event stream for {:?}, which is two missed \
-                             pings",
-                            self.timings.read_timeout
-                        )),
-                        Ok(None) => return Ended::Reconnect(
+                        None => return Ended::Reconnect(
                             "the service closed the event stream".to_owned(),
                         ),
-                        Ok(Some(Err(e))) => return Ended::Reconnect(
+                        Some(Err(e)) => return Ended::Reconnect(
                             format!("the event stream failed: {e}"),
                         ),
-                        Ok(Some(Ok(message))) => {
+                        Some(Ok(message)) => {
                             if let Some(ended) =
                                 self.handle(token, message, &mut bridged, &mut control).await
                             {
@@ -772,11 +789,17 @@ impl Relay {
         }
     }
 
-    /// `GET /events`, as a stream of parsed messages.
+    /// `GET /events`, as a stream of parsed messages, and when the stream last carried any bytes.
     async fn open_stream(
         &self,
         token: &str,
-    ) -> Result<impl futures_util::Stream<Item = Result<Inbound, String>> + Unpin, Ended> {
+    ) -> Result<
+        (
+            impl futures_util::Stream<Item = Result<Inbound, String>> + Unpin,
+            Heard,
+        ),
+        Ended,
+    > {
         let url = format!("{}/events", self.base);
         let response = self
             .client
@@ -799,8 +822,11 @@ impl Relay {
 
         // `eventsource-stream` owns the framing: `data:` split across TCP reads, multi-line
         // payloads, comments and the fields we do not use. What is left here is JSON.
+        let heard: Heard = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
+        let stamp = Arc::clone(&heard);
         let events = response
             .bytes_stream()
+            .inspect(move |_| *stamp.lock().expect("not poisoned") = tokio::time::Instant::now())
             .eventsource()
             .filter_map(|event| async move {
                 match event {
@@ -810,7 +836,7 @@ impl Relay {
                     Ok(event) => Some(classify(&event.data)),
                 }
             });
-        Ok(Box::pin(events))
+        Ok((Box::pin(events), heard))
     }
 
     /// Read until the welcome, which is the message that says the peer now exists.
@@ -1746,10 +1772,13 @@ mod tests {
 
         /// Push a message down the open stream, as the service would.
         fn push(&self, message: serde_json::Value) {
+            self.push_raw(format!("data: {message}\n\n"));
+        }
+
+        /// Push bytes down the open stream exactly as given — a ping, which is no message.
+        fn push_raw(&self, framed: String) {
             let sender = self.push.lock().unwrap().clone().expect("a stream is open");
-            sender
-                .send(message.to_string())
-                .expect("the stream is live");
+            sender.send(framed).expect("the stream is live");
         }
     }
 
@@ -1813,8 +1842,8 @@ mod tests {
                         // real service learns to evict a producer.
                         let _closing = closing;
                         yield Ok::<_, std::io::Error>(format!("data: {welcome}\n\n"));
-                        while let Some(message) = rx.recv().await {
-                            yield Ok(format!("data: {message}\n\n"));
+                        while let Some(framed) = rx.recv().await {
+                            yield Ok(framed);
                         }
                     };
                     (
@@ -2012,6 +2041,84 @@ mod tests {
                 >= 2
         })
         .await;
+        task.abort();
+    }
+
+    /// A stream that stays open and goes quiet is a dead one, and is reconnected after
+    /// `read_timeout` — the proxy in front of the service holding the socket while passing
+    /// nothing, so `startSession` never arrives while the robot reports itself registered.
+    ///
+    /// The heartbeat is the case that hid it: it is faster than the timeout, and a timeout that
+    /// started over on every turn of the loop was restarted by it before it could ever expire.
+    #[tokio::test]
+    async fn a_stream_that_goes_quiet_is_reconnected() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = fake_service().await;
+        *service.state.heartbeat_seconds.lock().unwrap() = Some(0.05);
+
+        let relay = Relay::new(
+            &service.base,
+            signed_in(&dir),
+            meta(),
+            Default::default(),
+            remote_json(&dir),
+        )
+        .unwrap()
+        .with_timings(Timings {
+            read_timeout: Duration::from_millis(300),
+            ..brisk()
+        });
+        let task = tokio::spawn(relay.run());
+        until("registration", || {
+            !service.state.of_type("setPeerStatus").is_empty()
+        })
+        .await;
+
+        // Heartbeats keep posting and the service keeps listing us; only the stream is silent.
+        until("a reconnect after the stream went quiet", || {
+            service.state.streams() >= 2
+        })
+        .await;
+        task.abort();
+    }
+
+    /// And a ping is not silence. The service's keepalive carries no message — the parser drops
+    /// it — so a deadline moved only by messages would reconnect an idle, healthy stream every
+    /// `read_timeout`.
+    #[tokio::test]
+    async fn a_ping_keeps_a_quiet_stream_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = fake_service().await;
+        *service.state.heartbeat_seconds.lock().unwrap() = Some(0.05);
+
+        let relay = Relay::new(
+            &service.base,
+            signed_in(&dir),
+            meta(),
+            Default::default(),
+            remote_json(&dir),
+        )
+        .unwrap()
+        .with_timings(Timings {
+            read_timeout: Duration::from_millis(300),
+            ..brisk()
+        });
+        let task = tokio::spawn(relay.run());
+        until("registration", || {
+            !service.state.of_type("setPeerStatus").is_empty()
+        })
+        .await;
+
+        // Four read timeouts' worth of pings and nothing else.
+        for _ in 0..12 {
+            service.state.push_raw(": ping\n\n".to_owned());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            service.state.streams(),
+            1,
+            "a pinged stream was reconnected"
+        );
         task.abort();
     }
 
