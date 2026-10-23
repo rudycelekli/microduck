@@ -101,6 +101,11 @@ enum Ride {
     /// The chorale holds the PCM: a writer thread is rendering one part of a score at whatever
     /// position the loop last published.
     Singing,
+    /// A theremin or a chorale part was put down: its writer is fading to silence and `aplay`
+    /// is draining the tail. Not [`Ride::Landing`], because the wheee's "released" cuts a
+    /// landing ride, and "released" is also what the trigger says when nobody has touched it —
+    /// so every fade was killed on the next tick. Only [`Sound::theremin_settle`] reaps this.
+    Fading,
 }
 
 /// The theremin's parameters, as the control loop hands them to the writer thread.
@@ -571,7 +576,7 @@ impl Sound {
             live.playing.store(false, Ordering::Relaxed);
         }
         self.singing = None;
-        self.ride = Ride::Landing;
+        self.ride = Ride::Fading;
     }
 
     /// The note a 0..1 closeness plays in this robot's voice, hertz.
@@ -639,7 +644,7 @@ impl Sound {
         if let Some(live) = self.live.take() {
             live.playing.store(false, Ordering::Relaxed);
         }
-        self.ride = Ride::Landing;
+        self.ride = Ride::Fading;
     }
 
     /// Reap a faded-out instrument, freeing the PCM for one-shots again.
@@ -649,7 +654,7 @@ impl Sound {
     /// held — which is correct, and is why a quack right after letting go is dropped rather
     /// than talking over the tail of the note.
     pub fn theremin_settle(&mut self) {
-        if self.ride == Ride::Landing && self.live.is_none() {
+        if matches!(self.ride, Ride::Landing | Ride::Fading) && self.live.is_none() {
             self.reap_landing();
         }
     }
@@ -687,7 +692,7 @@ impl Sound {
         // the pad), and a ride restarting under a theremin would be an instrument that
         // stops whenever the player touches anything. The instrument keeps the PCM until
         // the loop takes it away; the trigger is simply inaudible while it does.
-        if matches!(self.ride, Ride::Theremin | Ride::Singing) {
+        if matches!(self.ride, Ride::Theremin | Ride::Singing | Ride::Fading) {
             return;
         }
         match hold {
@@ -897,6 +902,54 @@ mod tests {
         assert_eq!(rate, sounds::SR);
         assert_eq!(pcm.len(), 480 * 2, "S16LE mono payload");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Putting the theremin or a chorale part down fades it out in the writer thread, and the
+    /// PCM stays held until `aplay` has drained the tail. The wheee trigger reads "released"
+    /// whenever nobody is holding it, and it used to treat the fade as a landing ride and kill
+    /// `aplay` on the very next tick — a click and a cut note, ~20 ms into a ~280 ms fade.
+    #[test]
+    fn a_put_down_instrument_fades_instead_of_being_cut() {
+        for playing in [Ride::Theremin, Ride::Singing] {
+            let mut sound = Sound::new(PathBuf::from("/nonexistent/bank"), "null".into());
+            sound.child = Some(
+                Command::new("sleep")
+                    .arg("5")
+                    .spawn()
+                    .expect("spawns sleep"),
+            );
+            sound.live = Some(Arc::new(Live::new()));
+            sound.ride = playing;
+
+            if playing == Ride::Theremin {
+                sound.theremin_stop();
+            } else {
+                sound.sing_stop();
+            }
+            // The next tick, in the loop's order: settle, then the hold, which says released.
+            sound.theremin_settle();
+            sound.wheee(WheeeHold::Released);
+            let child = sound
+                .child
+                .as_mut()
+                .expect("the fading voice keeps its aplay");
+            assert!(
+                matches!(child.try_wait(), Ok(None)),
+                "{playing:?}: the fade was cut on the next tick"
+            );
+            assert_ne!(
+                sound.ride,
+                Ride::Off,
+                "{playing:?}: the PCM is still the tail's"
+            );
+
+            // Once the tail has drained, the settle frees the PCM for one-shots again.
+            let _ = child.kill();
+            let _ = child.wait();
+            sound.theremin_settle();
+            assert_eq!(sound.ride, Ride::Off, "{playing:?}");
+            assert!(sound.child.is_none());
+        }
     }
 
     /// A missing bank must degrade to silence, not errors — robots without a codec walk on.
